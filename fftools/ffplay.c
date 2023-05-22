@@ -118,13 +118,19 @@ typedef struct MyAVPacketList {
 
 typedef struct PacketQueue {
     MyAVPacketList *first_pkt, *last_pkt;
-    int nb_packets;
-    int size;
-    int64_t duration;
-    int abort_request;
+    int nb_packets;     //队列里有多少个AVPackage
+    int size;           //队列缓存的数据大小 ，算法是所有的 AVPacket 本身的大小加上 AVPacket->size
+    int64_t duration;   //队列的时长，通过累加 队列里所有的 AVPacket->duration 得到
+    int abort_request;  //代表队列终止请求，变成 1 会导致 audio_thread 跟 video_thread 退出。
+
+    /**
+     * //队列的序号，每次跳转播放时间点 ，serial 就会 +1。另一个数据结构 MyAVPacketList 里面也有一个 serial 字段
+     * 两个 serial 通过比较匹配来丢弃无效的缓存帧，什么情况会导致队列的缓存帧无效？跳转播放时间点的时候。
+     * 例如此时此刻，PacketQueue 队列里面缓存了 8 个帧，但是这 8 个帧都 第30分钟 才开始播放的，如果你通过 ➔ 按键前进到 第35分钟 的位置播放，那队列的 8 个缓存帧就无效了，需要丢弃。
+     * 由于每次跳转播放时间点， PacketQueue::serial 都会 +1 ，而 MyAVPacketList::serial 的值还是原来的，两个 serial 不一样，就会丢弃帧。*/
     int serial;
-    SDL_mutex *mutex;
-    SDL_cond *cond;
+    SDL_mutex *mutex;   //互斥锁，主要用于修改队列的时候加锁
+    SDL_cond *cond;     //条件变量，用于 read_thread() 线程 跟 audio_thread() ，video_thread() 线程 进行通信的
 } PacketQueue;
 
 #define VIDEO_PICTURE_QUEUE_SIZE 3
@@ -202,7 +208,15 @@ typedef struct Decoder {
 } Decoder;
 
 typedef struct VideoState {
+    /**
+     * read_thread 的线程ID
+     * C++14 标准库有跨平台的线程库，但是 C语言 是没有跨平台的线程库，所以 ffplay 取巧了，使用了 SDL 库的线程跟条件变量，SDL 是跨平台的。*/
     SDL_Thread *read_tid;
+    /**
+     * iformat,容器格式，ffplay默认根据filename的后缀名来确定容器格式，但是也可以指定某种格式来解析文件，如下命令:
+     * ffplay -i juren-5s.mp4 -f flv
+     * 通过命令行参数指定的 -f flv 就会被存储到AVInputFormat *iformat，当然不是存储字符串，有一个根据字符串找到AVInputFormat
+     * 的过程 */
     AVInputFormat *iformat;
     int abort_request;
     int force_refresh;
@@ -217,10 +231,16 @@ typedef struct VideoState {
     AVFormatContext *ic;
     int realtime;
 
-    Clock audclk;
-    Clock vidclk;
+    Clock audclk;       //音频始终，记录音频流目前的播放时刻
+    Clock vidclk;       //视频，同上
+    /**
+     * 外部时钟，取第一帧 音频 或 视频的 pts 作为 起始时间，然后随着物理时间的消逝增长，所以是物理时间的当前时刻。
+     * 到底是以音频的第一帧，还是视频的第一帧？取决于 av_read_frame() 函数第一次读到的是音频还是视频。*/
     Clock extclk;
 
+    /**
+     * 视频、音频、字幕的AVFrame队列 
+     * FrameQueue与PacketQueue这两结构很重要，两种通过FrameQueue内部PacketQueue指针关联*/
     FrameQueue pictq;
     FrameQueue subpq;
     FrameQueue sampq;
@@ -231,16 +251,20 @@ typedef struct VideoState {
 
     int audio_stream;
 
+    /**
+     * 音视频同步方式，有 3 种同步方式，以音频时钟为准，以视频时钟为准，以外部时钟为准。默认方式是以音频时钟为准*/
     int av_sync_type;
 
     double audio_clock;
+    /**这个字段比较独特，只有音频有，视频没有，没有一个 video_clock_serial 字段。
+     * audio_clock_serial 只是一个用做临时用途的变量，实际上存储的就是 AVFrame 的 serial 字段。不用特别关注。而视频直接用的 AVFrame 的 serial。*/
     int audio_clock_serial;
     double audio_diff_cum; /* used for AV difference average computation */
     double audio_diff_avg_coef;
     double audio_diff_threshold;
     int audio_diff_avg_count;
-    AVStream *audio_st;
-    PacketQueue audioq;
+    AVStream *audio_st;             //音频流
+    PacketQueue audioq;             //音频AVPacket队列
     int audio_hw_buf_size;
     uint8_t *audio_buf;
     uint8_t *audio_buf1;
@@ -248,8 +272,8 @@ typedef struct VideoState {
     unsigned int audio_buf1_size;
     int audio_buf_index; /* in bytes */
     int audio_write_buf_size;
-    int audio_volume;
-    int muted;
+    int audio_volume;               //播放器声音的大小
+    int muted;                      //是否静音，C语言C99标准是没有 bool 类型的，都用 int 代替
     struct AudioParams audio_src;
 #if CONFIG_AVFILTER
     struct AudioParams audio_filter_src;
@@ -275,22 +299,22 @@ typedef struct VideoState {
     SDL_Texture *vid_texture;
 
     int subtitle_stream;
-    AVStream *subtitle_st;
-    PacketQueue subtitleq;
+    AVStream *subtitle_st;          //字幕流
+    PacketQueue subtitleq;          //字幕AVPacket队列
 
     double frame_timer;
     double frame_last_returned_time;
     double frame_last_filter_delay;
     int video_stream;
-    AVStream *video_st;
-    PacketQueue videoq;
+    AVStream *video_st;             //视频流
+    PacketQueue videoq;             //视频AVPacket队列
     double max_frame_duration;      // maximum duration of a frame - above this, we consider the jump a timestamp discontinuity
     struct SwsContext *img_convert_ctx;
     struct SwsContext *sub_convert_ctx;
     int eof;
 
-    char *filename;
-    int width, height, xleft, ytop;
+    char *filename;                     //filename存储音视频文件，或者网络地址url
+    int width, height, xleft, ytop;     //分别代表播放器窗口的 宽高 跟 位置。位置通过 xleft 跟 ytop 来定位的
     int step;
 
 #if CONFIG_AVFILTER
@@ -302,8 +326,18 @@ typedef struct VideoState {
     AVFilterGraph *agraph;              // audio filter graph
 #endif
 
+    /**
+     * last_video_stream, last_audio_stream, last_subtitle_stream代表最后一个视频/音频/字幕流，音视频文件
+     * 里可能有多个流*/
     int last_video_stream, last_audio_stream, last_subtitle_stream;
 
+    /**
+     * 这是一个 SDL 的条件变量，用于线程间通信的。read_thread() 线程在以下两种情况会进入休眠 10ms。
+     * 第一种情况：PacketQueue 队列满了，无法再塞数据进去。
+     * 第二种情况：超过最小缓存size。
+     * 如果在 10ms 内，PacketQueue 队列全部被消耗完毕，audio_thread() 或者 video_thread() 线程 没有 AVPakcet 能读了，就需要尽快唤醒 read_thread() 线程。
+     * 还有，如果进行了 seek 操作，也需要快速把 read_thread() 线程 从休眠中唤醒。
+     * 所以 SDL_cond *continue_read_thread 条件变量，主要用于 read_thread 跟 audio_thread ，video_thread 线程进行通信的。*/
     SDL_cond *continue_read_thread;
 } VideoState;
 
@@ -492,6 +526,9 @@ static int packet_queue_init(PacketQueue *q)
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
         return AVERROR(ENOMEM);
     }
+    /**
+     * abort_request 字段如果置为 1， audio_thread() 跟 video_thread() 解码线程就会退出。所以在创建解码线程 之前，ffplay 会把 abort_request 置为 0 
+     * 见函数packet_queue_start*/
     q->abort_request = 1;
     return 0;
 }
@@ -702,6 +739,8 @@ static int frame_queue_init(FrameQueue *f, PacketQueue *pktq, int max_size, int 
     }
     f->pktq = pktq;
     f->max_size = FFMIN(max_size, FRAME_QUEUE_SIZE);
+    /**
+     *  这个 !! 操作没有什么特别，实际上就是把大于 1 的数字转成 1。如果 keep_last 等于 5，取反两次之后，就会变成 1 了*/
     f->keep_last = !!keep_last;
     for (i = 0; i < f->max_size; i++)
         if (!(f->queue[i].frame = av_frame_alloc()))
@@ -2710,12 +2749,22 @@ out:
     return ret;
 }
 
+/**
+ * 在播放本地文件的时候，interrupt_callback 回调函数的作用不是特别明显，因为本地读取MP4， av_read_frame() 会非常快返回。
+ * 但是如果在播放网络流的时候，网络卡顿，av_read_frame() 可能要 8 秒才能返回，这时候如果想关闭播放器，就需要 av_read_frame() 
+ * 尽快地返回，不要再阻塞了。这时候，就需要 interrupt_callback 了，因为在 8 秒 内，av_read_frame() 内部也会定时执行 
+ * interrupt_callback()，只要 interrupt_callback() 返回 1，av_read_frame() 就会不再阻塞，立即返回。
+ * 提醒：播放网络流的时候，avformat_find_stream_info() 可能会跟 av_read_frame() 一样阻塞很久。
+ */
 static int decode_interrupt_cb(void *ctx)
 {
     VideoState *is = ctx;
     return is->abort_request;
 }
 
+/**
+ * stream_has_enough_packets() 主要就是确认 队列至少有 MIN_FRAMES 个帧，而且所有帧的播放时长加起来大于 1 秒钟。
+ */
 static int stream_has_enough_packets(AVStream *st, int stream_id, PacketQueue *queue) {
     return stream_id < 0 ||
            queue->abort_request ||
@@ -2745,6 +2794,11 @@ static int read_thread(void *arg)
     VideoState *is = arg;
     AVFormatContext *ic = NULL;
     int err, i, ret;
+    /**
+     * 这个数组涵盖了各种数据流，音频，视频，字幕，附件流等等。因为一个MP4里面可能会有多个视频流。
+     * 例如 第 5，第 6 个流都是视频流。这时候 st_index[AVMEDIA_TYPE_VIDEO] 保存的可能就是 5 或者 6 ，代表要播放哪个视频流，其他数据流类推。
+     * 默认 st_index[] 数组的值是通过 av_find_best_stream() 确定的，是通过 bit_rate 最大比特率，codec_info_nb_frames 等参数找出 最好的那个音频流 或者 视频流。
+     */
     int st_index[AVMEDIA_TYPE_NB];
     AVPacket pkt1, *pkt = &pkt1;
     int64_t stream_start_time;
@@ -2769,12 +2823,23 @@ static int read_thread(void *arg)
         ret = AVERROR(ENOMEM);
         goto fail;
     }
+
+    /**
+     * 中断回调函数 */
     ic->interrupt_callback.callback = decode_interrupt_cb;
     ic->interrupt_callback.opaque = is;
     if (!av_dict_get(format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE)) {
         av_dict_set(&format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
+
+    /**
+     * 最后的参数 format_opts 是一个 AVDictionary （字典）。注意，如果 avformat_open_input 函数内部使用了字典的某个选项，就会把这个选项从字典剔除。
+     * 所以可以看到，后面判断了还有哪些 option 没使用，这些无法使用的 option （选项），通常是因为命令行参数写错了。
+     * MP4，FLV，TS，等等容器格式，都有一些相同的 option，也有一些不同的 options。具体可以通过以下命令查看容器支持哪些 option ？
+     * ffmpeg -h demuxer=mp4
+     * 提示：各种流媒体格式 也可以看成是 容器
+     */
     err = avformat_open_input(&ic, is->filename, is->iformat, &format_opts);
     if (err < 0) {
         print_error(is->filename, err);
@@ -2883,7 +2948,10 @@ static int read_thread(void *arg)
     if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
         AVStream *st = ic->streams[st_index[AVMEDIA_TYPE_VIDEO]];
         AVCodecParameters *codecpar = st->codecpar;
-        AVRational sar = av_guess_sample_aspect_ratio(ic, st, NULL);
+        /**sar 这个值是不太容易理解的，我刚开始也被这个 sar 搞懵。我之前以为 sar 等于 width/height （宽高比） ，后来发现不是宽高比。
+         * 其实 sar 是以前的显示设备设计的历史遗留问题，不用过多关注，只需要知道，显示的时候用 sar 这个比例拉伸 width 跟 height 作为显示窗口，图像播放就不会扭曲了。sar 在大部分情况都是 1:1
+         * AVRational sar = av_guess_sample_aspect_ratio(ic, st, NULL);
+         */
         if (codecpar->width)
             set_default_window_size(codecpar->width, codecpar->height, sar);
     }
@@ -2919,6 +2987,11 @@ static int read_thread(void *arg)
             break;
         if (is->paused != is->last_paused) {
             is->last_paused = is->paused;
+
+            /**
+             * 对于播放本地文件，av_read_pause() 函数其实是没有作用的。av_read_pause() 只对网络流播放有效，有些流媒体协议支持暂停操作，
+             * 暂停了，服务器就不会再往 ffplay 推送数据，如果想重新推数据，需要调用 av_read_play()
+             */
             if (is->paused)
                 is->read_pause_return = av_read_pause(ic);
             else
@@ -2946,6 +3019,8 @@ static int read_thread(void *arg)
                 av_log(NULL, AV_LOG_ERROR,
                        "%s: error while seeking\n", is->ic->url);
             } else {
+                /**
+                 * flush_pkt是静态全局变量，在packet_queue_put内部会重新开辟内存来存储数据*/
                 if (is->audio_stream >= 0) {
                     packet_queue_flush(&is->audioq);
                     packet_queue_put(&is->audioq, &flush_pkt);
@@ -2981,7 +3056,10 @@ static int read_thread(void *arg)
             is->queue_attachments_req = 0;
         }
 
-        /* if the queue are full, no need to read more */
+        /**
+         *  if the queue are full, no need to read more 
+         * 判断 队列缓存中的 AVPacket 是否够用，够用就会休眠 10ms
+         * 在播放本地文件的时候，infinite_buffer 总是 0，所以不用管它。*/
         if (infinite_buffer<1 &&
               (is->audioq.size + is->videoq.size + is->subtitleq.size > MAX_QUEUE_SIZE
             || (stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq) &&
@@ -3026,6 +3104,20 @@ static int read_thread(void *arg)
         /* check if packet is in play range specified by user, then queue, otherwise discard */
         stream_start_time = ic->streams[pkt->stream_index]->start_time;
         pkt_ts = pkt->pts == AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+
+        /**
+         * 当 队列缓存中的 AVPacket 未满的时候，就会直接去读磁盘数据，把 AVPacket 读出来，但是也不是读出来就会立即丢进去 
+         * PacketQueue 队列，而是会判断一下AVPacket 是否在期待的播放时间范围内
+         * 可以看到 定义了 一个 变量 pkt_in_play_range 来确定是否在播放时间范围内。播放时间范围这个概念是这样的。如果下面这样播放一个视频：
+         *          ffplay -i juren-5s.mp4
+         * 因为 juren-5s.mp4 是一个 5 秒的视频，而且命令行没有指定 -t，所以这时候 播放时间范围 就是 0 ~ 5 秒。只要读出来的 AVPacket 的 pts 
+         * 在 0 ~ 5秒范围内，pkt_in_play_range 变量就为真。因此所有读出来的 AVPacket 都是符合播放时间范围的, 但是如果加了 -t 参数，如下：
+         *          ffplay -t 2 -i juren-5s.mp4
+         * 上面的的命令是 只播放 2秒视频，也就是 播放时间范围 变成了 0 ~ 2 秒，如果读出来的 AVPacket 的 pts 大于 2 秒，就会被丢弃。
+         * 这里就有一个有趣的事情，当视频播放到 第二秒的时候，虽然画面停止了，但是 read_thread() 还是会一直读数据，但由于不符合播放时间范围，
+         * 会一直丢弃。直到读到文件结尾，返回 AVERROR_EOF 才会停下来休眠一小段时间。读出来的 AVPacket 符合播放时间之后，就会 用 packet_queue_put() 
+         * 丢进去 PacketQueue 队列
+         */
         pkt_in_play_range = duration == AV_NOPTS_VALUE ||
                 (pkt_ts - (stream_start_time != AV_NOPTS_VALUE ? stream_start_time : 0)) *
                 av_q2d(ic->streams[pkt->stream_index]->time_base) -
@@ -3066,17 +3158,21 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
     is = av_mallocz(sizeof(VideoState));
     if (!is)
         return NULL;
+
     is->last_video_stream = is->video_stream = -1;
     is->last_audio_stream = is->audio_stream = -1;
     is->last_subtitle_stream = is->subtitle_stream = -1;
+
     is->filename = av_strdup(filename);
     if (!is->filename)
         goto fail;
+
     is->iformat = iformat;
     is->ytop    = 0;
     is->xleft   = 0;
 
-    /* start video display */
+    /* start video display 
+     * 初始化各个队列*/
     if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
         goto fail;
     if (frame_queue_init(&is->subpq, &is->subtitleq, SUBPICTURE_QUEUE_SIZE, 0) < 0)
@@ -3089,6 +3185,7 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
         packet_queue_init(&is->subtitleq) < 0)
         goto fail;
 
+    /**创建条件变量*/
     if (!(is->continue_read_thread = SDL_CreateCond())) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
         goto fail;
